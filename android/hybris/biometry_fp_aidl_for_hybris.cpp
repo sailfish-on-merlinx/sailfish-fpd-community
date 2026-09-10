@@ -38,7 +38,10 @@
 
 #include <condition_variable>
 #include <atomic>
+#include <deque>
+#include <functional>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include <aidl/android/hardware/biometrics/common/ICancellationSignal.h>
@@ -107,6 +110,70 @@ static int64_t gAuthenticatorId = 0;
  * never swallowed - only the immediate repeat is.
  */
 static std::atomic<bool> gCanceledDelivered{false};
+
+/* HAL callbacks are never run on the binder thread that delivered them.
+ *
+ * fpd's handlers call straight back into the HAL: AndroidFP::enrollCallback()
+ * ends an enrolment by calling postEnroll(), which is revokeChallenge(). Doing
+ * that from inside the callback deadlocks both sides - the HAL thread is still
+ * waiting for the callback to return, so it cannot service the new call. The
+ * kernel binder log shows the pair on one thread of ours and one of theirs:
+ *
+ *   thread 13129:
+ *     outgoing transaction 160249: from 13128:13129 to 3113:3667 code 2
+ *     incoming transaction 160248: from 3113:3667 to 13128:13129 code 5
+ *
+ * The visible symptom was an enrolment that reached 100% and then stopped:
+ * progress 1 was emitted, postEnroll() never returned, so fpd never reached
+ * succeeded() and never saved the finger.
+ *
+ * One worker thread, FIFO, so ordering between callbacks is preserved and the
+ * binder thread is released immediately. Deliberately never destroyed: fpd is
+ * killed by SIGTERM and tearing this down at exit only risks a race.
+ */
+class CallbackDispatcher
+{
+public:
+    void post(std::function<void()> fn)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mLock);
+            if (!mStarted) {
+                mStarted = true;
+                std::thread(&CallbackDispatcher::run, this).detach();
+            }
+            mQueue.push_back(std::move(fn));
+        }
+        mCv.notify_one();
+    }
+
+private:
+    void run()
+    {
+        pthread_setname_np(pthread_self(), "fp-callbacks");
+        for (;;) {
+            std::function<void()> fn;
+            {
+                std::unique_lock<std::mutex> lock(mLock);
+                mCv.wait(lock, [this] { return !mQueue.empty(); });
+                fn = std::move(mQueue.front());
+                mQueue.pop_front();
+            }
+            fn();
+        }
+    }
+
+    std::mutex mLock;
+    std::condition_variable mCv;
+    std::deque<std::function<void()>> mQueue;
+    bool mStarted = false;
+};
+
+static CallbackDispatcher &dispatcher()
+{
+    static CallbackDispatcher *d = new CallbackDispatcher();
+    return *d;
+}
 
 struct UHardwareBiometry_
 {
@@ -194,11 +261,13 @@ struct SessionCallback : public fp::BnSessionCallback
 
     ::ndk::ScopedAStatus onAcquired(AcquiredInfo info, int32_t vendorCode) override
     {
-        if (hybris_fp_instance_cb && hybris_fp_instance_cb->acquired_cb)
-            hybris_fp_instance_cb->acquired_cb(kDeviceId,
-                                               AIDLToUFingerprintAcquiredInfo(info),
-                                               vendorCode,
-                                               hybris_fp_instance_cb->context);
+        UHardwareBiometryFingerprintAcquiredInfo uinfo =
+            AIDLToUFingerprintAcquiredInfo(info);
+        dispatcher().post([uinfo, vendorCode] {
+            if (hybris_fp_instance_cb && hybris_fp_instance_cb->acquired_cb)
+                hybris_fp_instance_cb->acquired_cb(kDeviceId, uinfo, vendorCode,
+                                                   hybris_fp_instance_cb->context);
+        });
         return ::ndk::ScopedAStatus::ok();
     }
 
@@ -209,29 +278,34 @@ struct SessionCallback : public fp::BnSessionCallback
             return ::ndk::ScopedAStatus::ok();
         }
 
-        if (hybris_fp_instance_cb && hybris_fp_instance_cb->error_cb)
-            hybris_fp_instance_cb->error_cb(kDeviceId,
-                                            AIDLToUFingerprintError(error),
-                                            vendorCode,
-                                            hybris_fp_instance_cb->context);
+        UHardwareBiometryFingerprintError uerr = AIDLToUFingerprintError(error);
+        dispatcher().post([uerr, vendorCode] {
+            if (hybris_fp_instance_cb && hybris_fp_instance_cb->error_cb)
+                hybris_fp_instance_cb->error_cb(kDeviceId, uerr, vendorCode,
+                                                hybris_fp_instance_cb->context);
+        });
         return ::ndk::ScopedAStatus::ok();
     }
 
     ::ndk::ScopedAStatus onEnrollmentProgress(int32_t enrollmentId, int32_t remaining) override
     {
-        if (hybris_fp_instance_cb && hybris_fp_instance_cb->enrollresult_cb)
-            hybris_fp_instance_cb->enrollresult_cb(kDeviceId, enrollmentId, gUserId,
-                                                   remaining,
-                                                   hybris_fp_instance_cb->context);
+        dispatcher().post([enrollmentId, remaining] {
+            if (hybris_fp_instance_cb && hybris_fp_instance_cb->enrollresult_cb)
+                hybris_fp_instance_cb->enrollresult_cb(kDeviceId, enrollmentId, gUserId,
+                                                       remaining,
+                                                       hybris_fp_instance_cb->context);
+        });
         return ::ndk::ScopedAStatus::ok();
     }
 
     ::ndk::ScopedAStatus onAuthenticationSucceeded(int32_t enrollmentId,
                                                    const HardwareAuthToken &) override
     {
-        if (hybris_fp_instance_cb && hybris_fp_instance_cb->authenticated_cb)
-            hybris_fp_instance_cb->authenticated_cb(kDeviceId, enrollmentId, gUserId,
-                                                    hybris_fp_instance_cb->context);
+        dispatcher().post([enrollmentId] {
+            if (hybris_fp_instance_cb && hybris_fp_instance_cb->authenticated_cb)
+                hybris_fp_instance_cb->authenticated_cb(kDeviceId, enrollmentId, gUserId,
+                                                        hybris_fp_instance_cb->context);
+        });
         return ::ndk::ScopedAStatus::ok();
     }
 
@@ -239,25 +313,31 @@ struct SessionCallback : public fp::BnSessionCallback
      * onAuthenticated() with fingerId 0. fpd relies on that, so keep it. */
     ::ndk::ScopedAStatus onAuthenticationFailed() override
     {
-        if (hybris_fp_instance_cb && hybris_fp_instance_cb->authenticated_cb)
-            hybris_fp_instance_cb->authenticated_cb(kDeviceId, 0, gUserId,
-                                                    hybris_fp_instance_cb->context);
+        dispatcher().post([] {
+            if (hybris_fp_instance_cb && hybris_fp_instance_cb->authenticated_cb)
+                hybris_fp_instance_cb->authenticated_cb(kDeviceId, 0, gUserId,
+                                                        hybris_fp_instance_cb->context);
+        });
         return ::ndk::ScopedAStatus::ok();
     }
 
     ::ndk::ScopedAStatus onLockoutTimed(int64_t) override
     {
-        if (hybris_fp_instance_cb && hybris_fp_instance_cb->error_cb)
-            hybris_fp_instance_cb->error_cb(kDeviceId, ERROR_LOCKOUT, 0,
-                                            hybris_fp_instance_cb->context);
+        dispatcher().post([] {
+            if (hybris_fp_instance_cb && hybris_fp_instance_cb->error_cb)
+                hybris_fp_instance_cb->error_cb(kDeviceId, ERROR_LOCKOUT, 0,
+                                                hybris_fp_instance_cb->context);
+        });
         return ::ndk::ScopedAStatus::ok();
     }
 
     ::ndk::ScopedAStatus onLockoutPermanent() override
     {
-        if (hybris_fp_instance_cb && hybris_fp_instance_cb->error_cb)
-            hybris_fp_instance_cb->error_cb(kDeviceId, ERROR_LOCKOUT, 0,
-                                            hybris_fp_instance_cb->context);
+        dispatcher().post([] {
+            if (hybris_fp_instance_cb && hybris_fp_instance_cb->error_cb)
+                hybris_fp_instance_cb->error_cb(kDeviceId, ERROR_LOCKOUT, 0,
+                                                hybris_fp_instance_cb->context);
+        });
         return ::ndk::ScopedAStatus::ok();
     }
 
@@ -276,39 +356,43 @@ struct SessionCallback : public fp::BnSessionCallback
      * still has to produce one call with fingerId 0, or fpd waits forever. */
     ::ndk::ScopedAStatus onEnrollmentsEnumerated(const std::vector<int32_t> &enrollmentIds) override
     {
-        if (!hybris_fp_instance_cb || !hybris_fp_instance_cb->enumerate_cb)
-            return ::ndk::ScopedAStatus::ok();
+        dispatcher().post([enrollmentIds] {
+            if (!hybris_fp_instance_cb || !hybris_fp_instance_cb->enumerate_cb)
+                return;
 
-        if (enrollmentIds.empty()) {
-            hybris_fp_instance_cb->enumerate_cb(kDeviceId, 0, gUserId, 0,
-                                                hybris_fp_instance_cb->context);
-        } else {
-            uint32_t remaining = enrollmentIds.size();
-            for (int32_t id : enrollmentIds) {
-                --remaining;
-                hybris_fp_instance_cb->enumerate_cb(kDeviceId, id, gUserId, remaining,
+            if (enrollmentIds.empty()) {
+                hybris_fp_instance_cb->enumerate_cb(kDeviceId, 0, gUserId, 0,
                                                     hybris_fp_instance_cb->context);
+            } else {
+                uint32_t remaining = enrollmentIds.size();
+                for (int32_t id : enrollmentIds) {
+                    --remaining;
+                    hybris_fp_instance_cb->enumerate_cb(kDeviceId, id, gUserId, remaining,
+                                                        hybris_fp_instance_cb->context);
+                }
             }
-        }
+        });
         return ::ndk::ScopedAStatus::ok();
     }
 
     ::ndk::ScopedAStatus onEnrollmentsRemoved(const std::vector<int32_t> &enrollmentIds) override
     {
-        if (!hybris_fp_instance_cb || !hybris_fp_instance_cb->removed_cb)
-            return ::ndk::ScopedAStatus::ok();
+        dispatcher().post([enrollmentIds] {
+            if (!hybris_fp_instance_cb || !hybris_fp_instance_cb->removed_cb)
+                return;
 
-        if (enrollmentIds.empty()) {
-            hybris_fp_instance_cb->removed_cb(kDeviceId, 0, gUserId, 0,
-                                              hybris_fp_instance_cb->context);
-        } else {
-            uint32_t remaining = enrollmentIds.size();
-            for (int32_t id : enrollmentIds) {
-                --remaining;
-                hybris_fp_instance_cb->removed_cb(kDeviceId, id, gUserId, remaining,
+            if (enrollmentIds.empty()) {
+                hybris_fp_instance_cb->removed_cb(kDeviceId, 0, gUserId, 0,
                                                   hybris_fp_instance_cb->context);
+            } else {
+                uint32_t remaining = enrollmentIds.size();
+                for (int32_t id : enrollmentIds) {
+                    --remaining;
+                    hybris_fp_instance_cb->removed_cb(kDeviceId, id, gUserId, remaining,
+                                                      hybris_fp_instance_cb->context);
+                }
             }
-        }
+        });
         return ::ndk::ScopedAStatus::ok();
     }
 
