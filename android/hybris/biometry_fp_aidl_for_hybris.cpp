@@ -37,6 +37,7 @@
 #include <endian.h>
 
 #include <condition_variable>
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -91,6 +92,21 @@ static bool gChallengeReady = false;
 static int64_t gChallenge = 0;
 static bool gAuthIdReady = false;
 static int64_t gAuthenticatorId = 0;
+
+/* One cancel must surface exactly one CANCELED.
+ *
+ * This vendor HAL answers a single ICancellationSignal::cancel() with two
+ * onError(CANCELED) callbacks - visible in fpd's log as a doubled error_cb and
+ * a doubled slot_failed for one Abort. fpd suppresses the second Failed()
+ * (its state is already FPSTATE_IDLE by then) but still emits ErrorInfo twice
+ * on the bus, so every client sees a terminal error for an operation that has
+ * already ended.
+ *
+ * Set when a CANCELED has been forwarded, cleared whenever a new operation
+ * starts or a fresh cancel is issued, so a genuine HAL-initiated CANCELED is
+ * never swallowed - only the immediate repeat is.
+ */
+static std::atomic<bool> gCanceledDelivered{false};
 
 struct UHardwareBiometry_
 {
@@ -188,6 +204,11 @@ struct SessionCallback : public fp::BnSessionCallback
 
     ::ndk::ScopedAStatus onError(Error error, int32_t vendorCode) override
     {
+        if (error == Error::CANCELED && gCanceledDelivered.exchange(true)) {
+            ALOGI("dropping repeated onError(CANCELED) for one cancel");
+            return ::ndk::ScopedAStatus::ok();
+        }
+
         if (hybris_fp_instance_cb && hybris_fp_instance_cb->error_cb)
             hybris_fp_instance_cb->error_cb(kDeviceId,
                                             AIDLToUFingerprintError(error),
@@ -549,6 +570,7 @@ UHardwareBiometryRequestStatus UHardwareBiometry_::enroll(uint32_t gid, uint32_t
         return SYS_UNKNOWN;
 
     (void) gid;
+    gCanceledDelivered = false;
     ::ndk::ScopedAStatus status = fpSession->enroll(hat, &fpCancel);
     if (!status.isOk()) {
         ALOGE("enroll failed: %s", status.getDescription().c_str());
@@ -596,6 +618,9 @@ UHardwareBiometryRequestStatus UHardwareBiometry_::cancel()
 {
     if (fpCancel == nullptr)
         return SYS_OK;
+
+    /* This cancel is entitled to one CANCELED of its own. */
+    gCanceledDelivered = false;
 
     ::ndk::ScopedAStatus status = fpCancel->cancel();
     fpCancel = nullptr;
@@ -649,6 +674,7 @@ UHardwareBiometryRequestStatus UHardwareBiometry_::authenticate(uint64_t operati
         return SYS_UNKNOWN;
     }
 
+    gCanceledDelivered = false;
     ::ndk::ScopedAStatus status =
         fpSession->authenticate(static_cast<int64_t>(operationId), &fpCancel);
     if (!status.isOk()) {
