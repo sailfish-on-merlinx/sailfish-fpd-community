@@ -152,7 +152,6 @@ private:
     QMap<uint32_t, QString> m_fingerMap;
 
     State m_state = FPSTATE_IDLE;
-    AcquiredState m_acquired = FPACQUIRED_UNSPECIFIED;
     QString m_addingFinger;
     bool m_verifyingRemoval = false;
     uint32_t m_removedFinger = 0;

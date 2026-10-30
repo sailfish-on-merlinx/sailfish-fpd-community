@@ -445,8 +445,12 @@ void FPDCommunity::slot_failed(const QString &message)
     qDebug() << Q_FUNC_INFO << message;
 
     emit ErrorInfo(message); // always report error via signal
-    if (m_state == FPSTATE_IDENTIFYING && message == "FINGER_NOT_RECOGNIZED")
+    if (m_state == FPSTATE_IDENTIFYING && message == "FINGER_NOT_RECOGNIZED") {
+        // Clients (sailfish-devicelock-fpd) learn of a rejected finger from
+        // this acquisition state, not from ErrorInfo.
+        emit AcquisitionInfo(QtEnumToString(FPACQUIRED_UNRECOGNIZED));
         return; // giving a chance to try another finger
+    }
 
     if (m_state != FPSTATE_IDLE) {
         emit Failed();
@@ -478,18 +482,14 @@ void FPDCommunity::slot_acquired(int info)
     case ACQUIRED_TOO_FAST:
         newState = FPACQUIRED_TOO_FAST;
         break;
-    case ACQUIRED_VENDOR:
-        newState = FPACQUIRED_UNRECOGNIZED;
-        break;
     default:
-        newState = FPACQUIRED_GOOD; //Should we default to good?
-        break;
+        // Vendor messages (finger down/up and the like) say nothing about a
+        // match; a rejected finger is reported from slot_failed().
+        return;
     }
 
-    if (newState != m_acquired) {
-        m_acquired = newState;
-        emit AcquisitionInfo(QtEnumToString(m_acquired));
-    }
+    // One signal per acquisition: mce takes each as user activity.
+    emit AcquisitionInfo(QtEnumToString(newState));
 }
 
 void FPDCommunity::slot_removed(uint32_t finger)
