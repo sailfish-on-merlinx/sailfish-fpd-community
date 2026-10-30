@@ -453,6 +453,12 @@ void FPDCommunity::slot_failed(const QString &message)
     }
 
     if (m_state != FPSTATE_IDLE) {
+        // A HAL may keep the operation running after an error (the Xiaomi
+        // AIDL service does after a timed lockout); stop it, or a later touch
+        // completes an operation nobody waits for.
+        m_cancelTimer.stop();
+        if (message != QLatin1String("ERROR_CANCELED"))
+            m_androidFP.cancel();
         emit Failed();
         setState(FPSTATE_IDLE);
     }
@@ -560,6 +566,10 @@ void FPDCommunity::finishRemoval()
 void FPDCommunity::slot_authenticated(uint32_t finger)
 {
     qDebug() << Q_FUNC_INFO << finger;
+    if (m_state != FPSTATE_IDENTIFYING) {
+        qWarning() << "Ignoring a match outside an identify operation";
+        return;
+    }
     m_cancelTimer.stop();
     if (m_fingerMap.contains(finger)){
         emit Identified(m_fingerMap[finger]);
