@@ -13,6 +13,11 @@ endif
 
 IS_ANDROID_8 := $(shell test $(ANDROID_VERSION_MAJOR) -ge 8 && echo true)
 
+# Android 13 dropped the HIDL fingerprint HAL. Devices on 13+ publish
+# android.hardware.biometrics.fingerprint.IFingerprint (AIDL) and no @2.x HIDL
+# interface at all, so the HIDL backend has nothing to talk to.
+IS_FP_AIDL := $(shell test $(ANDROID_VERSION_MAJOR) -ge 13 && echo true)
+
 include $(CLEAR_VARS)
 
 LOCAL_CFLAGS += \
@@ -34,7 +39,10 @@ endif
 LOCAL_C_INCLUDES := \
 	$(UPAPI_PATH)/src
 
-ifeq ($(IS_ANDROID_8),true)
+ifeq ($(IS_FP_AIDL),true)
+LOCAL_SRC_FILES += \
+    biometry_fp_aidl_for_hybris.cpp
+else ifeq ($(IS_ANDROID_8),true)
 LOCAL_SRC_FILES += \
     biometry_fp_hidl_for_hybris.cpp
 else
@@ -54,7 +62,17 @@ LOCAL_SHARED_LIBRARIES := \
 	libhardware_legacy \
 	libdl
 
-ifeq ($(IS_ANDROID_8),true)
+ifeq ($(IS_FP_AIDL),true)
+# The AIDL interface has its C++ backend disabled upstream, so this is the NDK
+# backend - hence libbinder_ndk rather than libbinder. Gatekeeper is still HIDL.
+LOCAL_SHARED_LIBRARIES += \
+    libhidlbase \
+    libbinder_ndk \
+    android.hardware.biometrics.fingerprint-V4-ndk \
+    android.hardware.biometrics.common-V4-ndk \
+    android.hardware.keymaster-V4-ndk \
+    android.hardware.gatekeeper@1.0
+else ifeq ($(IS_ANDROID_8),true)
 LOCAL_SHARED_LIBRARIES += \
     libhidlbase \
     libhidltransport \
