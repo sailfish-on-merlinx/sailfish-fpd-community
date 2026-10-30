@@ -201,6 +201,17 @@ struct Shared
     /* Enrolment ids the HAL has reported, for remove(gid, 0). */
     std::mutex enrolledLock;
     std::set<int32_t> enrolled;
+
+    /* HAL lockouts are reset as soon as they happen, the way Jolla's fpslave
+     * does: attempts are limited by the device lock ("Too many unrecognized
+     * fingers"), which never learns of a HAL lockout and cannot show one. A
+     * reset needs a HardwareAuthToken for a fresh challenge, and the session
+     * calls cannot be made from a callback, so this runs on the dispatcher. */
+    std::mutex sessionLock;
+    std::shared_ptr<ISession> session;
+    std::atomic<bool> lockedOut{false};
+    bool lockoutChallengePending = false; // guarded by waitLock
+    int64_t lockoutChallenge = 0;         // dispatcher thread only
 };
 
 Shared &shared()
@@ -239,17 +250,88 @@ void forwardList(const std::vector<int32_t> &ids, bool removed)
     });
 }
 
+HardwareAuthToken toHat(const AuthToken &t);
+
+std::shared_ptr<ISession> currentSession()
+{
+    Shared &s = shared();
+    std::lock_guard<std::mutex> lock(s.sessionLock);
+    return s.session;
+}
+
+/* The reset could not be done: report the lockout as before. */
+void forwardLockout()
+{
+    shared().lockedOut = false;
+    post([](const UHardwareBiometryParams &p) {
+        if (p.error_cb)
+            p.error_cb(kDeviceId, ERROR_LOCKOUT, 0, p.context);
+    });
+}
+
+/* Dispatcher thread: first step of a reset, ask for a challenge. */
+void requestLockoutChallenge()
+{
+    Shared &s = shared();
+    std::shared_ptr<ISession> session = currentSession();
+    if (session == nullptr) {
+        forwardLockout();
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(s.waitLock);
+        s.lockoutChallengePending = true;
+    }
+    ::ndk::ScopedAStatus status = session->generateChallenge();
+    if (!status.isOk()) {
+        ALOGE("generateChallenge for lockout reset failed: %s", status.getDescription().c_str());
+        {
+            std::lock_guard<std::mutex> lock(s.waitLock);
+            s.lockoutChallengePending = false;
+        }
+        forwardLockout();
+    }
+}
+
+/* Dispatcher thread: authorise the reset with a token for that challenge. */
+void resetLockout(int64_t challenge)
+{
+    Shared &s = shared();
+    std::shared_ptr<ISession> session = currentSession();
+    AuthToken token;
+    if (session == nullptr
+        || !gatekeeperAuthToken(static_cast<uint32_t>(s.userId.load()),
+                                static_cast<uint64_t>(challenge), &token)) {
+        forwardLockout();
+        return;
+    }
+    s.lockoutChallenge = challenge;
+    ::ndk::ScopedAStatus status = session->resetLockout(toHat(token));
+    if (!status.isOk()) {
+        ALOGE("resetLockout failed: %s", status.getDescription().c_str());
+        forwardLockout();
+    }
+}
+
 struct SessionCallback : public fp::BnSessionCallback
 {
     ::ndk::ScopedAStatus onChallengeGenerated(int64_t challenge) override
     {
         Shared &s = shared();
+        bool forLockout;
         {
             std::lock_guard<std::mutex> lock(s.waitLock);
-            s.challenge = challenge;
-            s.challengeReady = true;
+            forLockout = s.lockoutChallengePending;
+            s.lockoutChallengePending = false;
+            if (!forLockout) {
+                s.challenge = challenge;
+                s.challengeReady = true;
+            }
         }
-        s.waitCv.notify_all();
+        if (forLockout)
+            dispatcher().post([challenge] { resetLockout(challenge); });
+        else
+            s.waitCv.notify_all();
         return ::ndk::ScopedAStatus::ok();
     }
 
@@ -322,26 +404,32 @@ struct SessionCallback : public fp::BnSessionCallback
         return ::ndk::ScopedAStatus::ok();
     }
 
-    ::ndk::ScopedAStatus onLockoutTimed(int64_t) override
+    ::ndk::ScopedAStatus onLockoutTimed(int64_t durationMillis) override
     {
-        post([](const UHardwareBiometryParams &p) {
-            if (p.error_cb)
-                p.error_cb(kDeviceId, ERROR_LOCKOUT, 0, p.context);
-        });
+        ALOGI("temporary fingerprint lockout (%lld ms), resetting",
+              static_cast<long long>(durationMillis));
+        lockedOut();
         return ::ndk::ScopedAStatus::ok();
     }
 
     ::ndk::ScopedAStatus onLockoutPermanent() override
     {
-        post([](const UHardwareBiometryParams &p) {
-            if (p.error_cb)
-                p.error_cb(kDeviceId, ERROR_LOCKOUT, 0, p.context);
-        });
+        ALOGI("permanent fingerprint lockout, resetting");
+        lockedOut();
         return ::ndk::ScopedAStatus::ok();
     }
 
     ::ndk::ScopedAStatus onLockoutCleared() override
     {
+        ALOGI("fingerprint lockout cleared");
+        shared().lockedOut = false;
+        dispatcher().post([] {
+            Shared &s = shared();
+            std::shared_ptr<ISession> session = currentSession();
+            if (s.lockoutChallenge != 0 && session != nullptr)
+                session->revokeChallenge(s.lockoutChallenge);
+            s.lockoutChallenge = 0;
+        });
         return ::ndk::ScopedAStatus::ok();
     }
 
@@ -393,6 +481,14 @@ struct SessionCallback : public fp::BnSessionCallback
     ::ndk::ScopedAStatus onSessionClosed() override
     {
         return ::ndk::ScopedAStatus::ok();
+    }
+
+private:
+    /* A locked-out HAL reports again on every touch; one reset is enough. */
+    static void lockedOut()
+    {
+        if (!shared().lockedOut.exchange(true))
+            dispatcher().post(requestLockoutChallenge);
     }
 };
 
@@ -660,6 +756,11 @@ private:
             std::lock_guard<std::mutex> lock(s.enrolledLock);
             s.enrolled.clear();
         }
+        {
+            Shared &s = shared();
+            std::lock_guard<std::mutex> lock(s.sessionLock);
+            s.session = nullptr;
+        }
 
         prepareVendorDe(userId);
 
@@ -674,6 +775,11 @@ private:
             return false;
         }
         shared().userId = userId;
+        {
+            Shared &s = shared();
+            std::lock_guard<std::mutex> lock(s.sessionLock);
+            s.session = mSession;
+        }
         return true;
     }
 
