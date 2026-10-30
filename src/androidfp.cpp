@@ -182,7 +182,7 @@ bool AndroidFP::enumerationAuthoritative() const
     return m_enumerationAuthoritative;
 }
 
-void AndroidFP::enumerateCallback(uint32_t finger, uint32_t remaining)
+void AndroidFP::enumerateCallback(quint32 finger, quint32 remaining)
 {
     qDebug() << Q_FUNC_INFO << finger << remaining;
     m_enumerateTimeout.stop();
@@ -195,7 +195,7 @@ void AndroidFP::enumerateCallback(uint32_t finger, uint32_t remaining)
     }
 }
 
-void AndroidFP::enrollCallback(uint32_t finger, uint32_t remaining)
+void AndroidFP::enrollCallback(quint32 finger, quint32 remaining)
 {
     qDebug() << Q_FUNC_INFO << finger << remaining;
 
@@ -216,7 +216,7 @@ void AndroidFP::enrollCallback(uint32_t finger, uint32_t remaining)
     }
 }
 
-void AndroidFP::removeCallback(uint32_t finger, uint32_t remaining)
+void AndroidFP::removeCallback(quint32 finger, quint32 remaining)
 {
     qDebug() << Q_FUNC_INFO << finger << remaining;
 
@@ -228,54 +228,67 @@ void AndroidFP::removeCallback(uint32_t finger, uint32_t remaining)
     }
 }
 
-void AndroidFP::acquiredCallback(UHardwareBiometryFingerprintAcquiredInfo info)
+void AndroidFP::acquiredCallback(int info)
 {
     qDebug() << Q_FUNC_INFO << info;
     emit acquired(info);
 }
 
+void AndroidFP::authenticatedCallback(quint32 finger)
+{
+    qDebug() << Q_FUNC_INFO << finger;
+    if (finger != 0)
+        emit authenticated(finger);
+    else
+        emit failed(QStringLiteral("FINGER_NOT_RECOGNIZED"));
+}
+
+void AndroidFP::errorCallback(int error, int vendorCode)
+{
+    qDebug() << Q_FUNC_INFO << error << vendorCode;
+    if (error == 0)
+        return;
+    emit failed(QString::fromUtf8(IntToStringFingerprintError(error, vendorCode).data()));
+}
+
+// The *_cb functions run on a backend thread: queue, never handle here.
+
 void AndroidFP::enrollresult_cb(uint64_t, uint32_t fingerId, uint32_t, uint32_t remaining, void *context)
 {
-    qDebug() << Q_FUNC_INFO << fingerId << remaining;
-    static_cast<AndroidFP*>(context)->enrollCallback(fingerId, remaining);
+    QMetaObject::invokeMethod(static_cast<AndroidFP*>(context), "enrollCallback",
+                              Qt::QueuedConnection,
+                              Q_ARG(quint32, fingerId), Q_ARG(quint32, remaining));
 }
 
 void AndroidFP::acquired_cb(uint64_t, UHardwareBiometryFingerprintAcquiredInfo info, int32_t, void *context)
 {
-    qDebug() << Q_FUNC_INFO << info;
-    static_cast<AndroidFP*>(context)->acquiredCallback(info);
+    QMetaObject::invokeMethod(static_cast<AndroidFP*>(context), "acquiredCallback",
+                              Qt::QueuedConnection, Q_ARG(int, info));
 }
 
 void AndroidFP::authenticated_cb(uint64_t, uint32_t fingerId, uint32_t, void *context)
 {
-    qDebug() << Q_FUNC_INFO << fingerId;
-
-    if (fingerId != 0)
-        static_cast<AndroidFP*>(context)->authenticated(fingerId);
-    else {
-        static_cast<AndroidFP*>(context)->failed("FINGER_NOT_RECOGNIZED");
-    }
+    QMetaObject::invokeMethod(static_cast<AndroidFP*>(context), "authenticatedCallback",
+                              Qt::QueuedConnection, Q_ARG(quint32, fingerId));
 }
 
 void AndroidFP::removed_cb(uint64_t, uint32_t fingerId, uint32_t, uint32_t remaining, void *context)
 {
-    qDebug() << Q_FUNC_INFO << fingerId << remaining;
-
-    static_cast<AndroidFP*>(context)->removeCallback(fingerId, remaining);
+    QMetaObject::invokeMethod(static_cast<AndroidFP*>(context), "removeCallback",
+                              Qt::QueuedConnection,
+                              Q_ARG(quint32, fingerId), Q_ARG(quint32, remaining));
 }
 
 void AndroidFP::enumerate_cb(uint64_t, uint32_t fingerId, uint32_t, uint32_t remaining, void *context)
 {
-    qDebug() << Q_FUNC_INFO << fingerId << remaining;
-
-    static_cast<AndroidFP*>(context)->enumerateCallback(fingerId, remaining);
+    QMetaObject::invokeMethod(static_cast<AndroidFP*>(context), "enumerateCallback",
+                              Qt::QueuedConnection,
+                              Q_ARG(quint32, fingerId), Q_ARG(quint32, remaining));
 }
 
 void AndroidFP::error_cb(uint64_t, UHardwareBiometryFingerprintError error, int32_t vendorCode, void *context)
 {
-    qDebug() << Q_FUNC_INFO << error << vendorCode;
-    if (error == 0) {
-        return;
-    }
-    static_cast<AndroidFP*>(context)->failed(QString::fromUtf8(IntToStringFingerprintError(error, vendorCode).data()));
+    QMetaObject::invokeMethod(static_cast<AndroidFP*>(context), "errorCallback",
+                              Qt::QueuedConnection,
+                              Q_ARG(int, error), Q_ARG(int, vendorCode));
 }

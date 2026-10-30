@@ -37,11 +37,17 @@ signals:
     void enumerated(); // fingerprint list ready
 
 private:
-    void enumerateCallback(uint32_t finger, uint32_t remaining);
+    // HAL callbacks arrive on a backend thread (a binder thread, or the AIDL
+    // backend's dispatcher). The static *_cb functions only queue these onto
+    // this object's thread, where the timer, the finger list and calls back
+    // into the HAL are safe.
+    Q_INVOKABLE void enumerateCallback(quint32 finger, quint32 remaining);
     QTimer m_enumerateTimeout;
-    void enrollCallback(uint32_t finger, uint32_t remaining);
-    void removeCallback(uint32_t finger, uint32_t remaining);
-    void acquiredCallback(UHardwareBiometryFingerprintAcquiredInfo info);
+    Q_INVOKABLE void enrollCallback(quint32 finger, quint32 remaining);
+    Q_INVOKABLE void removeCallback(quint32 finger, quint32 remaining);
+    Q_INVOKABLE void acquiredCallback(int info);
+    Q_INVOKABLE void authenticatedCallback(quint32 finger);
+    Q_INVOKABLE void errorCallback(int error, int vendorCode);
 
     static void enrollresult_cb(uint64_t, uint32_t, uint32_t, uint32_t, void *);
     static void acquired_cb(uint64_t, UHardwareBiometryFingerprintAcquiredInfo, int32_t, void *);
